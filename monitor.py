@@ -141,26 +141,44 @@ def fetch_page(url: str, timeout: int = 30) -> str | None:
 
 
 # Phrases that indicate Wizards has the site behind a maintenance/holding page
-# (HTTP 200, but the body says it's down). Matched case-insensitively.
+# (HTTP 200, but the page itself is the maintenance page). Matched against
+# <title> and top-level <h1> only — substring matching against the whole body
+# false-positived for ~20 days on a promo banner that contained one of these
+# phrases, silently suppressing all product detection.
 _MAINTENANCE_INDICATORS = (
     "we'll be right back",
     "we will be right back",
     "be right back",
     "under maintenance",
-    "site is temporarily unavailable",
+    "site maintenance",
+    "scheduled maintenance",
     "temporarily unavailable",
-    "503 service unavailable",
-    "service is unavailable",
-    "site is currently down",
+    "service unavailable",
+    "503",
 )
 
 
 def is_maintenance_page(html: str | None) -> bool:
-    """Detect a 'site down' holding page that loaded as 200 OK."""
+    """Detect a 'site down' holding page that loaded as 200 OK.
+
+    Only considers the <title> and top-level <h1> text — real maintenance pages
+    set these explicitly, and ignoring body text avoids false-positives on
+    promo banners that happen to contain phrases like "be right back".
+    """
     if not html:
         return False
-    lower = html.lower()
-    return any(indicator in lower for indicator in _MAINTENANCE_INDICATORS)
+    soup = BeautifulSoup(html, "html.parser")
+    candidates: list[str] = []
+    if soup.title and soup.title.string:
+        candidates.append(soup.title.string)
+    for h1 in soup.find_all("h1"):
+        text = h1.get_text(strip=True)
+        if text:
+            candidates.append(text)
+    haystack = " ".join(candidates).lower()
+    if not haystack:
+        return False
+    return any(indicator in haystack for indicator in _MAINTENANCE_INDICATORS)
 
 
 def parse_products(html: str) -> dict[str, dict]:
@@ -458,16 +476,22 @@ def run_check(state: dict) -> tuple[dict, bool]:
         MAINTENANCE_REQUEST_TIMEOUT_SECONDS if was_in_maintenance else 30
     )
 
-    # Use the main store page as the canonical signal for site health. The
-    # chaos vault page is legitimately empty most of the time, and shop_all
-    # can lag, so we don't want either to be the trigger.
     now = datetime.now(timezone.utc)
-    store_html = fetch_page(PAGES["store"], timeout=fetch_timeout)
+
+    # Fetch every page up front. Product detection always runs on every page
+    # regardless of the store page's state — silently gating product checks on
+    # the homepage being healthy hid two missed drops for ~20 days when the
+    # store page false-positived as "in maintenance".
+    page_html: dict[str, str | None] = {}
+    for source, url in PAGES.items():
+        log.debug("Checking %s: %s", source, url)
+        page_html[source] = fetch_page(url, timeout=fetch_timeout)
+
+    # ---- Maintenance tracking (purely informational; never blocks below) ----
+    store_html = page_html.get("store")
     store_down = store_html is None or is_maintenance_page(store_html)
 
     if store_down:
-        # Track the start of a continuous outage. Only a sustained outage (vs.
-        # a brief maintenance blip) should trigger the alert.
         down_since_raw = state.get("down_since")
         if down_since_raw is None:
             down_since = now
@@ -491,26 +515,18 @@ def run_check(state: dict) -> tuple[dict, bool]:
                 down_minutes,
                 MAINTENANCE_ALERT_AFTER_MINUTES,
             )
-        state["last_check"] = now.isoformat()
-        return state, state.get("maintenance_mode", False)
+    else:
+        state["down_since"] = None
+        if was_in_maintenance:
+            log.info("Secret Lair site is back online")
+            state["maintenance_mode"] = False
 
-    # Site is up — clear the outage timer and announce recovery if needed.
-    state["down_since"] = None
-    if was_in_maintenance:
-        log.info("Secret Lair site is back online — checking for new products")
-        state["maintenance_mode"] = False
+    # ---- Product detection (always runs, every page, every cycle) ----
+    for source, _url in PAGES.items():
+        html = page_html.get(source)
+        if html is None:
+            continue
 
-    # Process the store page we already fetched, then the rest.
-    for source, url in PAGES.items():
-        if source == "store":
-            html = store_html
-        else:
-            log.debug("Checking %s: %s", source, url)
-            html = fetch_page(url, timeout=fetch_timeout)
-            if html is None:
-                continue
-
-        # Special Chaos Vault open/close detection
         if source == "chaos_vault":
             is_active = check_chaos_vault_active(html)
             if is_active and not chaos_vault_was_active:
@@ -522,7 +538,6 @@ def run_check(state: dict) -> tuple[dict, bool]:
 
         products = parse_products(html)
         new_products = []
-
         for pid, product in products.items():
             if pid not in known:
                 log.info("New product found: [%s] %s (%s)", pid, product["name"], source)
@@ -532,13 +547,12 @@ def run_check(state: dict) -> tuple[dict, bool]:
                     "first_seen": datetime.now(timezone.utc).isoformat(),
                     "source": source,
                 }
-
         if new_products:
             send_discord_notification(new_products, source)
 
     state["known_products"] = known
-    state["last_check"] = datetime.now(timezone.utc).isoformat()
-    return state, False
+    state["last_check"] = now.isoformat()
+    return state, state.get("maintenance_mode", False)
 
 
 def main() -> None:
