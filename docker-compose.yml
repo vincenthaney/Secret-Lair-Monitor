@@ -1,6 +1,7 @@
 services:
   secretlair:
     image: ghcr.io/epiphanyplx/secret-lair-monitor:latest
+    build: .
     container_name: secretlair
     restart: unless-stopped
     env_file: .env

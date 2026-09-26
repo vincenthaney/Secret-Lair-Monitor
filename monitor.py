@@ -5,6 +5,7 @@ Polls the Secret Lair store and Chaos Vault pages for new products,
 then sends Discord webhook notifications when new items appear.
 """
 
+import argparse
 import json
 import logging
 import os
@@ -317,6 +318,133 @@ def send_discord_notification(products: list[dict], source: str) -> bool:
     return True
 
 
+def send_current_state_notification(
+    products: list[dict],
+    available_pages: list[str],
+    unavailable_pages: list[str],
+    chaos_vault_active: bool | None,
+) -> bool:
+    """Post a snapshot of currently visible products and page availability."""
+    if not DISCORD_WEBHOOK_URL:
+        log.error("DISCORD_WEBHOOK_URL is not set; cannot post current state")
+        return False
+
+    source_labels = {
+        "store": "Secret Lair Store",
+        "chaos_vault": "Chaos Vault",
+        "shop_all": "Shop All",
+    }
+    if chaos_vault_active is None:
+        vault_status = "Unknown (page unavailable)"
+    else:
+        vault_status = "Open" if chaos_vault_active else "Closed"
+
+    status_lines = [f"**Chaos Vault:** {vault_status}"]
+    if available_pages:
+        status_lines.append(
+            "**Updated pages:** "
+            + ", ".join(source_labels.get(page, page) for page in available_pages)
+        )
+    if unavailable_pages:
+        status_lines.append(
+            "**Unavailable pages (snapshot is partial):** "
+            + ", ".join(source_labels.get(page, page) for page in unavailable_pages)
+        )
+    if not products and available_pages:
+        status_lines.append("No products were found on the available pages.")
+    elif not available_pages:
+        status_lines.append("No pages could be fetched; current products cannot be confirmed.")
+
+    description = "\n".join(status_lines)
+    if products:
+        header = f"\n\n**Current products ({len(products)}):**\n"
+        description += header
+        for index, product in enumerate(products):
+            source = source_labels.get(product.get("source"), product.get("source", "Unknown"))
+            line = f"• [{product['name']}]({product['url']}) — {source}"
+            if product.get("price"):
+                line += f" — {product['price']}"
+            line += "\n"
+            remaining = len(products) - index - 1
+            omitted_note = f"… and {remaining} more products omitted.\n" if remaining else ""
+            if len(description) + len(line) + len(omitted_note) > 4096:
+                description += f"… and {len(products) - index} more products omitted."
+                break
+            description += line
+
+    embed = {
+        "title": "Current Secret Lair State",
+        "description": description,
+        "color": 0x7B2D8B,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    payload = {
+        "username": "Secret Lair Monitor",
+        "avatar_url": "https://cdn-prod.scalefast.com/public/assets/img/resized/"
+                      "wizardsofthecoast-secret-lair/favicon-32.png",
+        "content": "**Current Secret Lair state**",
+        "embeds": [embed],
+    }
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+        if resp.status_code == 429:
+            retry_after = resp.json().get("retry_after", 5)
+            log.warning("Rate limited by Discord, waiting %.1fs", retry_after)
+            time.sleep(retry_after)
+            resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        log.error("Failed to post current state to Discord: %s", e)
+        return False
+
+    log.info("Current state posted (%d products)", len(products))
+    return True
+
+
+def post_current_state(state: dict) -> bool:
+    """Fetch current pages, persist discovered products, and post one snapshot."""
+    known = state.get("known_products", {})
+    products_by_id: dict[str, dict] = {}
+    available_pages: list[str] = []
+    unavailable_pages: list[str] = []
+    chaos_vault_active: bool | None = None
+
+    for source, url in PAGES.items():
+        log.info("Refreshing %s: %s", source, url)
+        html = fetch_page(url, timeout=30)
+        if html is None or is_maintenance_page(html):
+            unavailable_pages.append(source)
+            continue
+
+        available_pages.append(source)
+        if source == "chaos_vault":
+            chaos_vault_active = check_chaos_vault_active(html)
+
+        for product_id, product in parse_products(html).items():
+            product_with_source = {**product, "source": source}
+            products_by_id[product_id] = product_with_source
+            previous = known.get(product_id, {})
+            known[product_id] = {
+                **previous,
+                **product,
+                "first_seen": previous.get("first_seen", datetime.now(timezone.utc).isoformat()),
+                "source": previous.get("source", source),
+            }
+
+    state["known_products"] = known
+    state["last_check"] = datetime.now(timezone.utc).isoformat()
+    if chaos_vault_active is not None:
+        state["chaos_vault_active"] = chaos_vault_active
+    save_state(state)
+
+    return send_current_state_notification(
+        list(products_by_id.values()),
+        available_pages,
+        unavailable_pages,
+        chaos_vault_active,
+    )
+
+
 def send_release_soon_notification() -> bool:
     """One-shot notification fired when the site goes into maintenance mode.
 
@@ -555,7 +683,23 @@ def run_check(state: dict) -> tuple[dict, bool]:
     return state, state.get("maintenance_mode", False)
 
 
-def main() -> None:
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Monitor Secret Lair product drops")
+    parser.add_argument(
+        "--post-current-state",
+        action="store_true",
+        help="Fetch the monitored pages, save state, post one current-state snapshot, and exit",
+    )
+    args = parser.parse_args()
+
+    if args.post_current_state:
+        log.info("Refreshing current Secret Lair state")
+        try:
+            return 0 if post_current_state(load_state()) else 1
+        except Exception:
+            log.exception("Failed to refresh and post current state")
+            return 1
+
     if not DISCORD_WEBHOOK_URL:
         log.warning(
             "DISCORD_WEBHOOK_URL is not set. Notifications will be logged but not sent."
@@ -620,4 +764,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

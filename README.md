@@ -49,6 +49,33 @@ Check logs:
 docker compose logs -f
 ```
 
+## Post a Current-State Snapshot
+
+To refresh the monitored pages and post their current products and Chaos Vault status to Discord, run the one-shot command. It updates `data/state.json` first and sends newly found products as part of the snapshot, without separate new-product alerts. If a page is unavailable, the message marks the snapshot as partial.
+
+With Docker Compose, make sure `.env` contains `DISCORD_WEBHOOK_URL`, then run:
+
+```bash
+docker compose run --build --rm secretlair python monitor.py --post-current-state
+```
+
+`--build` builds the current repository code first. This uses the service's existing `/data` volume, so it shares state with the running monitor. The one-shot container exits after posting.
+
+To run locally, install the packages from `requirements.txt`, set `DISCORD_WEBHOOK_URL`, and point `STATE_FILE` at the repo's data file. In PowerShell:
+
+```powershell
+$env:DISCORD_WEBHOOK_URL = "<your Discord webhook URL>"
+$env:STATE_FILE = "./data/state.json"
+python monitor.py --post-current-state
+```
+
+In Bash:
+
+```bash
+export DISCORD_WEBHOOK_URL="<your Discord webhook URL>"
+STATE_FILE=./data/state.json python monitor.py --post-current-state
+```
+
 ## Configuration
 
 All config is via environment variables (set in `.env`):
